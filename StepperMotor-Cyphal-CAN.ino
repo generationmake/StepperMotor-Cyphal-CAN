@@ -81,6 +81,9 @@ ExecuteCommand::Response_1_1 onExecuteCommand_1_1_Request_Received(ExecuteComman
 
 DEBUG_INSTANCE(80, Serial);
 
+static unsigned int motor0_speed = 0;
+static int motor0_steps = 0;
+
 ArduinoMCP2515 mcp2515([]() { digitalWrite(MCP2515_CS_PIN, LOW); },
                        []() { digitalWrite(MCP2515_CS_PIN, HIGH); },
                        [](uint8_t const d) { return SPI.transfer(d); },
@@ -102,6 +105,8 @@ cyphal::Publisher<uavcan::primitive::scalar::Integer16_1_0> analog_input_1_pub;
 cyphal::Subscription led_subscription;
 
 cyphal::Subscription output_0_subscription, output_1_subscription;
+
+cyphal::Subscription motor0_speed_subscription, motor0_steps_subscription;
 
 cyphal::ServiceServer execute_command_srv = node_hdl.create_service_server<ExecuteCommand::Request_1_1, ExecuteCommand::Response_1_1>(2*1000*1000UL, onExecuteCommand_1_1_Request_Received);
 
@@ -162,6 +167,8 @@ static CanardPortID port_id_output0              = std::numeric_limits<CanardPor
 static CanardPortID port_id_output1              = std::numeric_limits<CanardPortID>::max();
 static CanardPortID port_id_analog_input0        = std::numeric_limits<CanardPortID>::max();
 static CanardPortID port_id_analog_input1        = std::numeric_limits<CanardPortID>::max();
+static CanardPortID port_id_motor0_speed         = std::numeric_limits<CanardPortID>::max();
+static CanardPortID port_id_motor0_steps         = std::numeric_limits<CanardPortID>::max();
 
 static uint16_t update_period_ms_inputvoltage        =  3*1000;
 static uint16_t update_period_ms_internaltemperature = 10*1000;
@@ -190,6 +197,10 @@ const auto reg_rw_cyphal_sub_output0_id                     = node_registry->exp
 const auto reg_ro_cyphal_sub_output0_type                   = node_registry->route ("cyphal.sub.output0.type",                  {true}, []() { return "uavcan.primitive.scalar.Bit.1.0"; });
 const auto reg_rw_cyphal_sub_output1_id                     = node_registry->expose("cyphal.sub.output1.id",                    {true}, port_id_output1);
 const auto reg_ro_cyphal_sub_output1_type                   = node_registry->route ("cyphal.sub.output1.type",                  {true}, []() { return "uavcan.primitive.scalar.Bit.1.0"; });
+const auto reg_rw_cyphal_sub_motor0_speed_id                = node_registry->expose("cyphal.sub.motor0_speed.id",                {true}, port_id_motor0_speed);
+const auto reg_ro_cyphal_sub_motor0_speed_type              = node_registry->route ("cyphal.sub.motor0_speed.type",              {true}, []() { return "uavcan.primitive.scalar.Natural16.1.0"; });
+const auto reg_rw_cyphal_sub_motor0_steps_id                = node_registry->expose("cyphal.sub.motor0_steps.id",                {true}, port_id_motor0_steps);
+const auto reg_ro_cyphal_sub_motor0_steps_type              = node_registry->route ("cyphal.sub.motor0_steps.type",              {true}, []() { return "uavcan.primitive.scalar.Integer16.1.0"; });
 const auto reg_rw_pico_update_period_ms_inputvoltage        = node_registry->expose("pico.update_period_ms.inputvoltage",        {true}, update_period_ms_inputvoltage);
 const auto reg_rw_pico_update_period_ms_internaltemperature = node_registry->expose("pico.update_period_ms.internaltemperature", {true}, update_period_ms_internaltemperature);
 const auto reg_rw_pico_update_period_ms_analoginput0        = node_registry->expose("pico.update_period_ms.analoginput0",        {true}, update_period_ms_analoginput0);
@@ -249,6 +260,14 @@ void setup()
   if (port_id_input_voltage != std::numeric_limits<CanardPortID>::max())
     input_voltage_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Real32_1_0>(port_id_input_voltage, 1*1000*1000UL /* = 1 sec in usecs. */);
 
+  if (port_id_internal_temperature != std::numeric_limits<CanardPortID>::max())
+    internal_temperature_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Real32_1_0>(port_id_internal_temperature, 1*1000*1000UL /* = 1 sec in usecs. */);
+
+  if (port_id_analog_input0 != std::numeric_limits<CanardPortID>::max())
+    analog_input_0_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer16_1_0>(port_id_analog_input0, 1*1000*1000UL /* = 1 sec in usecs. */);
+  if (port_id_analog_input1 != std::numeric_limits<CanardPortID>::max())
+    analog_input_1_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer16_1_0>(port_id_analog_input1, 1*1000*1000UL /* = 1 sec in usecs. */);
+
   if (port_id_led1 != std::numeric_limits<CanardPortID>::max())
     led_subscription = node_hdl.create_subscription<uavcan::primitive::scalar::Bit_1_0>(
       port_id_led1,
@@ -259,9 +278,6 @@ void setup()
         else
           digitalWrite(LED_BUILTIN, LOW);
       });
-
-  if (port_id_internal_temperature != std::numeric_limits<CanardPortID>::max())
-    internal_temperature_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Real32_1_0>(port_id_internal_temperature, 1*1000*1000UL /* = 1 sec in usecs. */);
 
   if (port_id_output0 != std::numeric_limits<CanardPortID>::max())
     output_0_subscription = node_hdl.create_subscription<uavcan::primitive::scalar::Bit_1_0>(
@@ -285,10 +301,20 @@ void setup()
           digitalWrite(OUTPUT_1_PIN, LOW);
       });
 
-  if (port_id_analog_input0 != std::numeric_limits<CanardPortID>::max())
-    analog_input_0_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer16_1_0>(port_id_analog_input0, 1*1000*1000UL /* = 1 sec in usecs. */);
-  if (port_id_analog_input1 != std::numeric_limits<CanardPortID>::max())
-    analog_input_1_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer16_1_0>(port_id_analog_input1, 1*1000*1000UL /* = 1 sec in usecs. */);
+  if (port_id_motor0_speed != std::numeric_limits<CanardPortID>::max())
+    motor0_speed_subscription = node_hdl.create_subscription<uavcan::primitive::scalar::Natural16_1_0>(
+      port_id_motor0_speed,
+      [](uavcan::primitive::scalar::Natural16_1_0 const & msg)
+      {
+        motor0_speed=msg.value;
+      });
+  if (port_id_motor0_steps != std::numeric_limits<CanardPortID>::max())
+    motor0_steps_subscription = node_hdl.create_subscription<uavcan::primitive::scalar::Integer16_1_0>(
+      port_id_motor0_steps,
+      [](uavcan::primitive::scalar::Integer16_1_0 const & msg)
+      {
+        motor0_steps=msg.value;
+      });
 
     /* set factory settings */
     if(update_period_ms_inputvoltage==0xFFFF)        update_period_ms_inputvoltage=3*1000;

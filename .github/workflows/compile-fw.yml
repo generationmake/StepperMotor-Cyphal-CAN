@@ -49,9 +49,6 @@ jobs:
             - name: 107-Arduino-UniqueId
             - name: 107-Arduino-24LCxx
             - name: 107-Arduino-littlefs
-            - source-url: https://github.com/adafruit/Adafruit_NeoPixel.git
-            - source-url: https://github.com/adafruit/Adafruit_NeoPixel_ZeroDMA.git
-            - source-url: https://github.com/adafruit/Adafruit_ZeroDMA.git
           sketches-report-path: ${{ env.SKETCHES_REPORTS_PATH }}
           sketch-paths: ./
 
