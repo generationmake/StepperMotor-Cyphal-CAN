@@ -20,6 +20,7 @@
 #include <107-Arduino-MCP2515.h>
 #include <107-Arduino-littlefs.h>
 #include <107-Arduino-24LCxx.hpp>
+#include "RPi_Pico_TimerInterrupt.h"
 
 #define DBG_ENABLE_ERROR
 #define DBG_ENABLE_WARNING
@@ -44,8 +45,8 @@ using namespace uavcan::node;
 
 static uint8_t const EEPROM_I2C_DEV_ADDR = 0x50;
 
-//static int const INPUT_0_PIN        =  6;
-//static int const INPUT_1_PIN        =  7;
+static int const MOTOR0_STEP_PIN    =  6;
+static int const MOTOR0_DIR_PIN     =  7;
 //static int const INPUT_2_PIN        =  8;
 //static int const INPUT_3_PIN        =  9;
 static int const OUTPUT_0_PIN       = 10;
@@ -74,12 +75,18 @@ static uint32_t const WATCHDOG_DELAY_ms = 1000;
 
 void onReceiveBufferFull(CanardFrame const & frame);
 ExecuteCommand::Response_1_1 onExecuteCommand_1_1_Request_Received(ExecuteCommand::Request_1_1 const &);
+bool TimerHandler0(struct repeating_timer *t);
 
 /**************************************************************************************
  * GLOBAL VARIABLES
  **************************************************************************************/
 
 DEBUG_INSTANCE(80, Serial);
+
+static unsigned int motor0_speed = 0;
+static int motor0_steps = 0;
+
+RPI_PICO_Timer ITimer0(0);
 
 ArduinoMCP2515 mcp2515([]() { digitalWrite(MCP2515_CS_PIN, LOW); },
                        []() { digitalWrite(MCP2515_CS_PIN, HIGH); },
@@ -102,6 +109,8 @@ cyphal::Publisher<uavcan::primitive::scalar::Integer16_1_0> analog_input_1_pub;
 cyphal::Subscription led_subscription;
 
 cyphal::Subscription output_0_subscription, output_1_subscription;
+
+cyphal::Subscription motor0_speed_subscription, motor0_steps_subscription;
 
 cyphal::ServiceServer execute_command_srv = node_hdl.create_service_server<ExecuteCommand::Request_1_1, ExecuteCommand::Response_1_1>(2*1000*1000UL, onExecuteCommand_1_1_Request_Received);
 
@@ -162,6 +171,8 @@ static CanardPortID port_id_output0              = std::numeric_limits<CanardPor
 static CanardPortID port_id_output1              = std::numeric_limits<CanardPortID>::max();
 static CanardPortID port_id_analog_input0        = std::numeric_limits<CanardPortID>::max();
 static CanardPortID port_id_analog_input1        = std::numeric_limits<CanardPortID>::max();
+static CanardPortID port_id_motor0_speed         = std::numeric_limits<CanardPortID>::max();
+static CanardPortID port_id_motor0_steps         = std::numeric_limits<CanardPortID>::max();
 
 static uint16_t update_period_ms_inputvoltage        =  3*1000;
 static uint16_t update_period_ms_internaltemperature = 10*1000;
@@ -190,6 +201,10 @@ const auto reg_rw_cyphal_sub_output0_id                     = node_registry->exp
 const auto reg_ro_cyphal_sub_output0_type                   = node_registry->route ("cyphal.sub.output0.type",                  {true}, []() { return "uavcan.primitive.scalar.Bit.1.0"; });
 const auto reg_rw_cyphal_sub_output1_id                     = node_registry->expose("cyphal.sub.output1.id",                    {true}, port_id_output1);
 const auto reg_ro_cyphal_sub_output1_type                   = node_registry->route ("cyphal.sub.output1.type",                  {true}, []() { return "uavcan.primitive.scalar.Bit.1.0"; });
+const auto reg_rw_cyphal_sub_motor0_speed_id                = node_registry->expose("cyphal.sub.motor0_speed.id",                {true}, port_id_motor0_speed);
+const auto reg_ro_cyphal_sub_motor0_speed_type              = node_registry->route ("cyphal.sub.motor0_speed.type",              {true}, []() { return "uavcan.primitive.scalar.Natural16.1.0"; });
+const auto reg_rw_cyphal_sub_motor0_steps_id                = node_registry->expose("cyphal.sub.motor0_steps.id",                {true}, port_id_motor0_steps);
+const auto reg_ro_cyphal_sub_motor0_steps_type              = node_registry->route ("cyphal.sub.motor0_steps.type",              {true}, []() { return "uavcan.primitive.scalar.Integer16.1.0"; });
 const auto reg_rw_pico_update_period_ms_inputvoltage        = node_registry->expose("pico.update_period_ms.inputvoltage",        {true}, update_period_ms_inputvoltage);
 const auto reg_rw_pico_update_period_ms_internaltemperature = node_registry->expose("pico.update_period_ms.internaltemperature", {true}, update_period_ms_internaltemperature);
 const auto reg_rw_pico_update_period_ms_analoginput0        = node_registry->expose("pico.update_period_ms.analoginput0",        {true}, update_period_ms_analoginput0);
@@ -249,6 +264,14 @@ void setup()
   if (port_id_input_voltage != std::numeric_limits<CanardPortID>::max())
     input_voltage_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Real32_1_0>(port_id_input_voltage, 1*1000*1000UL /* = 1 sec in usecs. */);
 
+  if (port_id_internal_temperature != std::numeric_limits<CanardPortID>::max())
+    internal_temperature_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Real32_1_0>(port_id_internal_temperature, 1*1000*1000UL /* = 1 sec in usecs. */);
+
+  if (port_id_analog_input0 != std::numeric_limits<CanardPortID>::max())
+    analog_input_0_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer16_1_0>(port_id_analog_input0, 1*1000*1000UL /* = 1 sec in usecs. */);
+  if (port_id_analog_input1 != std::numeric_limits<CanardPortID>::max())
+    analog_input_1_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer16_1_0>(port_id_analog_input1, 1*1000*1000UL /* = 1 sec in usecs. */);
+
   if (port_id_led1 != std::numeric_limits<CanardPortID>::max())
     led_subscription = node_hdl.create_subscription<uavcan::primitive::scalar::Bit_1_0>(
       port_id_led1,
@@ -259,9 +282,6 @@ void setup()
         else
           digitalWrite(LED_BUILTIN, LOW);
       });
-
-  if (port_id_internal_temperature != std::numeric_limits<CanardPortID>::max())
-    internal_temperature_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Real32_1_0>(port_id_internal_temperature, 1*1000*1000UL /* = 1 sec in usecs. */);
 
   if (port_id_output0 != std::numeric_limits<CanardPortID>::max())
     output_0_subscription = node_hdl.create_subscription<uavcan::primitive::scalar::Bit_1_0>(
@@ -285,10 +305,35 @@ void setup()
           digitalWrite(OUTPUT_1_PIN, LOW);
       });
 
-  if (port_id_analog_input0 != std::numeric_limits<CanardPortID>::max())
-    analog_input_0_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer16_1_0>(port_id_analog_input0, 1*1000*1000UL /* = 1 sec in usecs. */);
-  if (port_id_analog_input1 != std::numeric_limits<CanardPortID>::max())
-    analog_input_1_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer16_1_0>(port_id_analog_input1, 1*1000*1000UL /* = 1 sec in usecs. */);
+  if (port_id_motor0_speed != std::numeric_limits<CanardPortID>::max())
+    motor0_speed_subscription = node_hdl.create_subscription<uavcan::primitive::scalar::Natural16_1_0>(
+      port_id_motor0_speed,
+      [](uavcan::primitive::scalar::Natural16_1_0 const & msg)
+      {
+        motor0_speed=msg.value;
+        int timer0_interval_ms=1000/motor0_speed;
+        if(timer0_interval_ms > 0)
+        {
+          // Interval in microsecs
+          if (ITimer0.attachInterruptInterval(timer0_interval_ms * 1000, TimerHandler0))
+          {
+            DBG_INFO("Starting ITimer0 OK");
+          }
+          else
+            DBG_ERROR("Can't set ITimer0. Select another Timer, freq. or timer");
+        }
+      });
+  if (port_id_motor0_steps != std::numeric_limits<CanardPortID>::max())
+    motor0_steps_subscription = node_hdl.create_subscription<uavcan::primitive::scalar::Integer16_1_0>(
+      port_id_motor0_steps,
+      [](uavcan::primitive::scalar::Integer16_1_0 const & msg)
+      {
+        motor0_steps=msg.value;
+        if(motor0_steps >= 0)
+          digitalWrite(MOTOR0_DIR_PIN, HIGH);
+        else
+          digitalWrite(MOTOR0_DIR_PIN, LOW);
+      });
 
     /* set factory settings */
     if(update_period_ms_inputvoltage==0xFFFF)        update_period_ms_inputvoltage=3*1000;
@@ -314,7 +359,7 @@ void setup()
     /* saturated uint8[16] unique_id */
     cyphal::support::UniqueId::instance().value(),
     /* saturated uint8[<=50] name */
-    "107-systems.CyphalPicoBase/CAN"
+    "107-systems.StepperMotor-Cyphal/CAN"
   );
 
   /* Setup LED pins and initialize */
@@ -329,6 +374,9 @@ void setup()
 //  pinMode(INPUT_2_PIN, INPUT_PULLUP);
 //  pinMode(INPUT_3_PIN, INPUT_PULLUP);
 
+  /* Setup Stepper Motor pins */
+  pinMode(MOTOR0_DIR_PIN, OUTPUT);
+  pinMode(MOTOR0_STEP_PIN, OUTPUT);
   /* Setup OUT0/OUT1. */
   pinMode(OUTPUT_0_PIN, OUTPUT);
   pinMode(OUTPUT_1_PIN, OUTPUT);
@@ -583,4 +631,16 @@ ExecuteCommand::Response_1_1 onExecuteCommand_1_1_Request_Received(ExecuteComman
   }
 
   return rsp;
+}
+
+bool TimerHandler0(struct repeating_timer *t)
+{
+  (void) t;
+
+  if(motor0_steps > 0)
+  {
+    digitalWrite(MOTOR0_STEP_PIN, !digitalRead(MOTOR0_STEP_PIN));
+    motor0_steps--;
+  }
+  return true;
 }
