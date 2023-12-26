@@ -20,6 +20,7 @@
 #include <107-Arduino-MCP2515.h>
 #include <107-Arduino-littlefs.h>
 #include <107-Arduino-24LCxx.hpp>
+#include "RPi_Pico_TimerInterrupt.h"
 
 #define DBG_ENABLE_ERROR
 #define DBG_ENABLE_WARNING
@@ -44,8 +45,8 @@ using namespace uavcan::node;
 
 static uint8_t const EEPROM_I2C_DEV_ADDR = 0x50;
 
-//static int const INPUT_0_PIN        =  6;
-//static int const INPUT_1_PIN        =  7;
+static int const MOTOR0_STEP_PIN    =  6;
+static int const MOTOR0_DIR_PIN     =  7;
 //static int const INPUT_2_PIN        =  8;
 //static int const INPUT_3_PIN        =  9;
 static int const OUTPUT_0_PIN       = 10;
@@ -74,6 +75,7 @@ static uint32_t const WATCHDOG_DELAY_ms = 1000;
 
 void onReceiveBufferFull(CanardFrame const & frame);
 ExecuteCommand::Response_1_1 onExecuteCommand_1_1_Request_Received(ExecuteCommand::Request_1_1 const &);
+bool TimerHandler0(struct repeating_timer *t);
 
 /**************************************************************************************
  * GLOBAL VARIABLES
@@ -83,6 +85,8 @@ DEBUG_INSTANCE(80, Serial);
 
 static unsigned int motor0_speed = 0;
 static int motor0_steps = 0;
+
+RPI_PICO_Timer ITimer0(0);
 
 ArduinoMCP2515 mcp2515([]() { digitalWrite(MCP2515_CS_PIN, LOW); },
                        []() { digitalWrite(MCP2515_CS_PIN, HIGH); },
@@ -307,6 +311,17 @@ void setup()
       [](uavcan::primitive::scalar::Natural16_1_0 const & msg)
       {
         motor0_speed=msg.value;
+        int timer0_interval_ms=1000/motor0_speed;
+        if(timer0_interval_ms > 0)
+        {
+          // Interval in microsecs
+          if (ITimer0.attachInterruptInterval(timer0_interval_ms * 1000, TimerHandler0))
+          {
+            DBG_INFO("Starting ITimer0 OK");
+          }
+          else
+            DBG_ERROR("Can't set ITimer0. Select another Timer, freq. or timer");
+        }
       });
   if (port_id_motor0_steps != std::numeric_limits<CanardPortID>::max())
     motor0_steps_subscription = node_hdl.create_subscription<uavcan::primitive::scalar::Integer16_1_0>(
@@ -314,6 +329,10 @@ void setup()
       [](uavcan::primitive::scalar::Integer16_1_0 const & msg)
       {
         motor0_steps=msg.value;
+        if(motor0_steps >= 0)
+          digitalWrite(MOTOR0_DIR_PIN, HIGH);
+        else
+          digitalWrite(MOTOR0_DIR_PIN, LOW);
       });
 
     /* set factory settings */
@@ -340,7 +359,7 @@ void setup()
     /* saturated uint8[16] unique_id */
     cyphal::support::UniqueId::instance().value(),
     /* saturated uint8[<=50] name */
-    "107-systems.CyphalPicoBase/CAN"
+    "107-systems.StepperMotor-Cyphal/CAN"
   );
 
   /* Setup LED pins and initialize */
@@ -355,6 +374,9 @@ void setup()
 //  pinMode(INPUT_2_PIN, INPUT_PULLUP);
 //  pinMode(INPUT_3_PIN, INPUT_PULLUP);
 
+  /* Setup Stepper Motor pins */
+  pinMode(MOTOR0_DIR_PIN, OUTPUT);
+  pinMode(MOTOR0_STEP_PIN, OUTPUT);
   /* Setup OUT0/OUT1. */
   pinMode(OUTPUT_0_PIN, OUTPUT);
   pinMode(OUTPUT_1_PIN, OUTPUT);
@@ -609,4 +631,16 @@ ExecuteCommand::Response_1_1 onExecuteCommand_1_1_Request_Received(ExecuteComman
   }
 
   return rsp;
+}
+
+bool TimerHandler0(struct repeating_timer *t)
+{
+  (void) t;
+
+  if(motor0_steps > 0)
+  {
+    digitalWrite(MOTOR0_STEP_PIN, !digitalRead(MOTOR0_STEP_PIN));
+    motor0_steps--;
+  }
+  return true;
 }
